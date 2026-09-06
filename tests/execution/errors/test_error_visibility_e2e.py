@@ -20,8 +20,10 @@ async def test_stdout_truncation_e2e():
     stdout = data.get("stdout") or ""
     assert "truncated" in stdout and "total characters" in stdout
     assert len(stdout) < 110000
+    # Both ends of the output survive; the middle is what gets dropped.
+    assert "Line 1:" in stdout
     assert "Line 4000:" in stdout
-    assert "Line 1:" not in stdout
+    assert "Line 2000:" not in stdout
 
 
 @pytest.mark.asyncio
