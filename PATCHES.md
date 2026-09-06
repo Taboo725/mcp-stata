@@ -16,6 +16,7 @@ Keeping the series linear and each commit small is what makes
 | 5 | `perf(server): budget stata_get_help output instead of returning whole pages` | `src/mcp_stata/server.py` (+1 new test file) |
 | 6 | `perf(server): drop pydantic title noise from advertised tool schemas` | `src/mcp_stata/server.py` (+1 new module, +1 new test file) |
 | 7 | `test(server): match the compact companion-text default upstream already ships` | `tests/server/test_fastmcp_compact_tool_text.py` |
+| 8 | `fix(server): detect packages by resolving commands, not by reading ado dir` | `src/mcp_stata/server.py` (+1 new test file) |
 
 ## 1. Worker spawn deadlocks on the stdio stdin pipe (Windows)
 
@@ -167,6 +168,40 @@ asserting the old `omit` behaviour, so a clean checkout fails that test. The
 test now covers both the `compact` default and `omit`-on-request. Drop this
 commit if upstream fixes it.
 
+## 8. `stata_doctor` reported installed packages as missing
+
+**Symptom.** `stata_doctor` warned that `reghdfe`, `estout` and others were not
+installed while `which reghdfe` returned
+`C:\Data\Stata\ado\plus\r\reghdfe.ado`. On this machine 9 of the 12 probed
+packages were false negatives; only `coefplot`, `boottest` and `csdid` were
+reported correctly.
+
+**Cause.** `_package_summary` ran `ado` and regex-searched the listing.
+`ado dir` reports only packages holding an entry in an ado directory's
+`stata.trk`, so a package whose files are installed but whose tracking entry is
+absent — copied in by hand, installed while PLUS pointed elsewhere, or left
+behind by a reset `stata.trk` — never appears. The listing here named 28
+packages and was complete; `reghdfe` and `estout` simply were not in it.
+
+The same scan produced false *positives* in the other direction: `\breghdfe\b`
+matched anywhere in the text, including inside another package's description
+("'IVREGHDFE': ... requires reghdfe"), so a dependency mentioned in prose read
+as installed.
+
+**Fix.** Ask Stata to resolve each command instead. One round trip runs
+`capture which` over every target and prints `mcp_pkg:<name>=<0|1>`, which is
+what "is this command available" actually means — it honours the whole adopath
+and does not care how the files arrived. `MCP_STATA_EXTRA_PACKAGES` (comma- or
+space-separated) adds targets to the built-in list; entries that are not plain
+identifiers are dropped, since names are interpolated into Stata code.
+
+**Measured.** Same machine: 10 of 12 present, and the two negatives verified
+genuine (`which gcollapse` also fails, so `gtools` really is absent).
+`stata_doctor` now warns about `gtools, eventstudyinteract` and nothing else.
+
+**Conflict risk.** Low. `_package_summary` is replaced wholesale and gains two
+helpers next to it; the `detect` branch gains one extra session call.
+
 ## What is *not* worth doing
 
 Measured and rejected, so it does not get re-proposed:
@@ -199,6 +234,7 @@ Regression tests for all four patches:
   tests/server/test_help_budget_unit.py \
   tests/server/test_schema_slim_unit.py \
   tests/server/test_fastmcp_compact_tool_text.py \
+  tests/server/test_package_detection_unit.py \
   tests/execution/startup \
   -q --no-cov
 ```
