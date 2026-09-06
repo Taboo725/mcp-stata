@@ -449,6 +449,14 @@ class SessionManager:
         await self.get_or_create_session(self._default_session_id)
 
     async def get_or_create_session(self, session_id: str, startup_do_file: Optional[str] = None) -> StataSession:
+        # A session that failed to come up must never be handed back or waited
+        # on again: discard it so this call builds a fresh worker instead of
+        # reporting the stale failure forever.
+        pooled = self._sessions.get(session_id)
+        if pooled is not None and (pooled.status == "error" or not pooled._process.is_alive()):
+            logger.info(f"Discarding unusable Stata session {session_id} (status={pooled.status})")
+            await self.stop_session(session_id)
+
         if session_id not in self._sessions:
             logger.info(f"Creating new Stata session: {session_id}")
             session = StataSession(session_id, startup_do_file=startup_do_file)
@@ -458,7 +466,7 @@ class SessionManager:
         
         # Wait for the session to be ready or fail, even if it was already created by another call.
         # Give it more time to start up on CI (especially Stata's first init).
-        timeout = 45.0 # Increased from 30.0 for CI stability
+        timeout = self._init_timeout()
         start_time = asyncio.get_running_loop().time()
         while session.status == "starting" and asyncio.get_running_loop().time() - start_time < timeout:
             if not session._process.is_alive():
@@ -468,21 +476,52 @@ class SessionManager:
             await asyncio.sleep(0.1)
             
         if session.status == "error":
-            raise RuntimeError(f"Stata session {session_id} failed to initialize. Stata binary may be missing or inaccessible.")
+            await self.stop_session(session_id)
+            raise RuntimeError(
+                f"Stata session {session_id} failed to initialize: the worker process exited "
+                f"before it was ready. Stata may be missing or inaccessible. "
+                f"The session was discarded; calling again starts a fresh one."
+            )
             
         if session.status == "starting":
-             # Still starting after timeout
-             session.status = "error"
-             raise RuntimeError(f"Stata session {session_id} timed out during initialization.")
+             # Still starting after timeout. Drop it rather than leaving a
+             # half-built session in the pool for the next call to trip over.
+             await self.stop_session(session_id)
+             raise TimeoutError(
+                 f"Stata session {session_id} did not become ready within {timeout:g}s. "
+                 f"The session was discarded; calling again starts a fresh one. "
+                 f"Raise {self._INIT_TIMEOUT_ENV} if Stata legitimately needs longer to start."
+             )
              
         return session
+
+    _INIT_TIMEOUT_ENV = "MCP_STATA_SESSION_INIT_TIMEOUT"
+    _DEFAULT_INIT_TIMEOUT = 45.0  # Stata's first in-process init, with CI headroom.
+
+    def _init_timeout(self) -> float:
+        """Seconds to wait for a worker to report ready, overridable by env."""
+        raw = (os.getenv(self._INIT_TIMEOUT_ENV) or "").strip()
+        if not raw:
+            return self._DEFAULT_INIT_TIMEOUT
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning(f"Ignoring non-numeric {self._INIT_TIMEOUT_ENV}={raw!r}")
+            return self._DEFAULT_INIT_TIMEOUT
+        if value <= 0:
+            logger.warning(f"Ignoring non-positive {self._INIT_TIMEOUT_ENV}={raw!r}")
+            return self._DEFAULT_INIT_TIMEOUT
+        return value
 
     def get_session(self, session_id: str) -> StataSession:
         if session_id not in self._sessions:
             raise ValueError(f"Session {session_id} not found.")
         session = self._sessions[session_id]
         if session.status == "error":
-            raise RuntimeError(f"Stata session {session_id} failed to initialize. Stata binary may be missing or inaccessible.")
+            raise RuntimeError(
+                f"Stata session {session_id} failed to initialize. Stata may be missing or "
+                f"inaccessible. Run a command against it to rebuild the session."
+            )
         return session
 
     def list_sessions(self) -> List[SessionInfo]:
