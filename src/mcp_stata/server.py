@@ -557,6 +557,64 @@ def _extract_help_format(help_text: str, format: str) -> str:
     return help_text
 
 
+_STDIN_DETACHED = False
+
+
+def _detach_stdin_from_children() -> None:
+    """Keep spawned Stata workers off the stdio transport's stdin pipe.
+
+    ``multiprocessing`` hands every spawned worker the parent's standard
+    handles.  On Windows the worker's interpreter start-up seeks fd 0 while
+    building ``sys.stdin``; if the server is parked in a synchronous read on
+    that same pipe -- which it always is between JSON-RPC messages -- the seek
+    blocks inside ``Py_InitializeFromConfig`` until the client happens to send
+    the next request.  The worker therefore never reports "ready" and the first
+    call on a freshly created session times out.
+
+    Point fd 0 at the null device, so children inherit a harmless handle, and
+    serve the transport from a private duplicate.
+    """
+    global _STDIN_DETACHED
+    if _STDIN_DETACHED or os.name != "nt":
+        return
+    if (os.getenv("MCP_STATA_NO_STDIN_DETACH") or "").strip().lower() in ("1", "true", "yes"):
+        return
+
+    import io
+
+    try:
+        transport_fd = os.dup(0)
+    except OSError as e:
+        logger.warning(f"Could not duplicate stdin; workers may start slowly: {e}")
+        return
+
+    try:
+        encoding = getattr(sys.stdin, "encoding", None) or "utf-8"
+        transport_stdin = io.TextIOWrapper(
+            io.BufferedReader(io.FileIO(transport_fd, "rb", closefd=True)),
+            encoding=encoding,
+            errors="replace",
+        )
+    except Exception as e:
+        os.close(transport_fd)
+        logger.warning(f"Could not wrap duplicated stdin; workers may start slowly: {e}")
+        return
+
+    try:
+        devnull_fd = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(devnull_fd, 0)
+        finally:
+            os.close(devnull_fd)
+    except OSError as e:
+        transport_stdin.close()
+        logger.warning(f"Could not redirect stdin to {os.devnull}; workers may start slowly: {e}")
+        return
+
+    sys.stdin = transport_stdin
+    _STDIN_DETACHED = True
+
+
 def _install_stdout_filter() -> None:
     """
     Redirect process stdout to a pipe and forward only JSON-RPC lines to the
@@ -2679,6 +2737,10 @@ def main():
                 multiprocessing.set_executable(real_py)
         except Exception:
             pass
+
+    # Keep spawned workers off the transport's stdin pipe (see the docstring:
+    # on Windows an inherited fd 0 stalls worker start-up).
+    _detach_stdin_from_children()
 
     # Filter non-JSON output off stdout to keep stdio transport clean.
     _install_stdout_filter()
