@@ -50,6 +50,7 @@ import time
 from .ui_http import UIChannelManager
 from .toolkit_catalog_data import SKILLS, SKILL_BY_ID, CHECKLISTS
 from .statest import runner as statest_runner
+from .fastmcp_schema_slim import install_slim_tool_schemas
 from .fastmcp_text_compact import install_compact_fastmcp_tool_text
 
 
@@ -147,6 +148,8 @@ mcp = FastMCP("mcp-stata")
 # Set version on the underlying server to expose it in InitializeResult
 mcp._mcp_server.version = SERVER_VERSION
 install_compact_fastmcp_tool_text()
+# Must precede the @mcp.tool decorators below: they build their schemas on import.
+install_slim_tool_schemas()
 
 session_manager = SessionManager()
 
