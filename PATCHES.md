@@ -13,6 +13,9 @@ Keeping the series linear and each commit small is what makes
 | 2 | `fix(sessions): discard sessions that fail to initialize instead of poisoning the pool` | `src/mcp_stata/sessions.py` (+1 new test file) |
 | 3 | `fix(client): stop the post-`clear all` startup reload from eating command output` | `src/mcp_stata/stata_client.py`, `tests/execution/startup/test_startup_do_file_unit.py` (+1 new test file) |
 | 4 | `fix(server): keep the head as well as the tail when truncating output` | `src/mcp_stata/server.py`, `tests/execution/errors/test_error_visibility_e2e.py` (+1 new test file) |
+| 5 | `perf(server): budget stata_get_help output instead of returning whole pages` | `src/mcp_stata/server.py` (+1 new test file) |
+| 6 | `perf(server): drop pydantic title noise from advertised tool schemas` | `src/mcp_stata/server.py` (+1 new module, +1 new test file) |
+| 7 | `test(server): match the compact companion-text default upstream already ships` | `tests/server/test_fastmcp_compact_tool_text.py` |
 
 ## 1. Worker spawn deadlocks on the stdio stdin pipe (Windows)
 
@@ -99,6 +102,82 @@ third and the last two thirds of the budget.
 
 **Conflict risk.** Low, one small function.
 
+## 5. `stata_get_help` returned whole help pages
+
+**Symptom.** One `stata_get_help` call could cost more context than the entire
+tool list. Measured against Stata 19, `format="full"` (the old default):
+
+| topic | raw help | after |
+|---|---|---|
+| `xtreg` | 43,612 chars (~11k tokens) | 4,181 |
+| `ivregress` | 22,328 | 4,181 |
+| `regress` | 16,744 | 2,759 |
+| `merge` | 11,218 | 3,448 |
+
+**Cause.** `_extract_help_format` returned `help_text` unchanged for `"full"`,
+and nothing capped any mode. The narrower modes were also mis-anchored: the
+`syntax` scan looked for a line *starting with* `syntax`, but rendered help uses
+a `## Syntax` markdown heading, so it always fell through to "first 24 lines";
+`options`/`examples` took the first line *containing* the word, which for
+`regress` is the `[, options]` syntax line — so `format="options"` returned the
+syntax table rather than the options section.
+
+**Fix.** Split the page on `## ` headings and select real sections. Add
+`brief` — syntax + description, followed by the names of the sections it
+dropped — and make it the default, so the model can ask for one section instead
+of paying for the page. Cap every mode, `full` included, at
+`MCP_STATA_HELP_MAX_CHARS` (default 4,000; `0` disables) via `_truncate_text`,
+which grew a `hint` parameter because help, unlike command output, is not
+recoverable from a log. Plain-text help has no headings, so those paths keep the
+old line heuristics.
+
+**Measured.** Seven common topics: 111,112 chars → 20,409. **-82%.**
+
+**Conflict risk.** Medium. `_extract_help_format` is rewritten wholesale, so an
+upstream change to it conflicts as a block — re-apply by taking this version.
+The `_truncate_text` signature change is additive and defaults to the old text.
+
+## 6. Every tool schema shipped pydantic's auto-generated titles
+
+**Symptom.** ~4,400 characters (~1,100 tokens) of `"title": "As Json"` beside
+`"as_json"`, on every request, in every conversation.
+
+**Cause.** Pydantic titles every model and field, and `model_json_schema()`
+emits all of them.
+
+**Fix.** `fastmcp_schema_slim.py` wraps `Tool.from_function` and strips `title`
+from each schema node, in both `parameters` and `output_schema`. A property
+*named* `title` (`ArtifactRef.title`) is reached through `properties` and
+survives. Nothing functional depends on these dicts: arguments validate against
+`FuncMetadata.arg_model` and results against `output_model`. Opt out with
+`MCP_STATA_SLIM_TOOL_SCHEMAS=0`.
+
+**Measured.** `inputSchema` across all 20 tools: 10,161 → 7,028 chars (-31%).
+`outputSchema` 56,000 → 39,256 (-30%); Claude Code does not send `outputSchema`
+to the model, but hosts that do now pay less.
+
+**Conflict risk.** Low. One new module plus one call site next to the existing
+`install_compact_fastmcp_tool_text()`.
+
+## 7. Upstream's companion-text test contradicts upstream's default
+
+Not our bug: upstream commit `a2f9c4a` changed the default companion mode to
+`compact` but left `test_convert_result_omits_duplicate_unstructured_json_by_default`
+asserting the old `omit` behaviour, so a clean checkout fails that test. The
+test now covers both the `compact` default and `omit`-on-request. Drop this
+commit if upstream fixes it.
+
+## What is *not* worth doing
+
+Measured and rejected, so it does not get re-proposed:
+
+- **Dropping `outputSchema`.** Claude Code sends only `description` and
+  `inputSchema` to the model; the 2.8KB envelope schema repeated across 20 tools
+  costs nothing there.
+- **`MCP_STATA_STRUCTURED_COMPANION_TEXT=omit`.** The payload arrives once, not
+  twice. `omit` saves bandwidth, not context, and risks blanking output on hosts
+  that read `content[]`.
+
 ## Syncing with upstream
 
 ```sh
@@ -117,6 +196,9 @@ Regression tests for all four patches:
   tests/server/test_stdin_detach_unit.py \
   tests/server/test_session_init_recovery_unit.py \
   tests/server/test_truncate_text_unit.py \
+  tests/server/test_help_budget_unit.py \
+  tests/server/test_schema_slim_unit.py \
+  tests/server/test_fastmcp_compact_tool_text.py \
   tests/execution/startup \
   -q --no-cov
 ```
