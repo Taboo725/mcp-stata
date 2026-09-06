@@ -533,28 +533,104 @@ def _compact_stored_results(results: dict, include_formatting: bool = False) -> 
     return compact
 
 
+HELP_BUDGET_ENV = "MCP_STATA_HELP_MAX_CHARS"
+_DEFAULT_HELP_BUDGET = 4000
+HELP_FORMATS = ("brief", "syntax", "options", "examples", "full")
+
+
+def _help_budget() -> int:
+    """Character ceiling for one help payload; ``0`` disables the cap."""
+    raw = os.environ.get(HELP_BUDGET_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_HELP_BUDGET
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_HELP_BUDGET
+
+
+def _split_help_sections(lines: list[str]) -> list[tuple[str, list[str]]]:
+    """Split rendered help into ``(heading, body)`` pairs, preamble first.
+
+    The text before the first ``## `` heading is returned under an empty
+    heading. ``plain_text=True`` help carries no headings, so the result is a
+    single entry and callers fall back to line heuristics.
+    """
+    sections: list[tuple[str, list[str]]] = [("", [])]
+    for line in lines:
+        if line.startswith("## "):
+            sections.append((line[3:].strip(), [line]))
+        else:
+            sections[-1][1].append(line)
+    return sections
+
+
+def _help_section_text(sections: list[tuple[str, list[str]]], *prefixes: str) -> str:
+    """Join every section whose heading starts with one of *prefixes*."""
+    out: list[str] = []
+    for heading, body in sections:
+        if heading and heading.lower().startswith(prefixes):
+            out.extend(body)
+    return "\n".join(out).strip()
+
+
 def _extract_help_format(help_text: str, format: str) -> str:
-    """Return concise slices of help text for syntax/options/examples modes."""
-    if format == "full":
-        return help_text
+    """Return a slice of help text sized for the requested mode.
+
+    Stata help pages are large — ``xtreg`` renders to ~43k characters — so every
+    mode is capped at :func:`_help_budget`. ``brief`` (the default) keeps the
+    syntax and description and names the sections it dropped, so the model can
+    ask for a specific one instead of paying for the whole page.
+    """
     lines = help_text.splitlines()
-    if format == "syntax":
-        out = [ln for ln in lines if ln.strip().lower().startswith("syntax")]
-        if out:
-            return "\n".join(out[:6]).strip()
-        return "\n".join(lines[:24]).strip()
-    if format in {"options", "examples"}:
-        marker = "options" if format == "options" else "examples"
-        start = None
-        for i, ln in enumerate(lines):
-            if marker in ln.strip().lower():
-                start = i
-                break
-        if start is None:
-            return "\n".join(lines[:40]).strip()
-        end = min(len(lines), start + 120)
-        return "\n".join(lines[start:end]).strip()
-    return help_text
+    sections = _split_help_sections(lines)
+    structured = len(sections) > 1
+
+    if format == "full":
+        rendered = help_text
+    elif format == "syntax":
+        rendered = _help_section_text(sections, "syntax") if structured else ""
+        if not rendered:
+            explicit = [ln for ln in lines if ln.strip().lower().startswith("syntax")]
+            rendered = "\n".join(explicit[:6] or lines[:24]).strip()
+    elif format in {"options", "examples"}:
+        rendered = _help_section_text(sections, format) if structured else ""
+        if not rendered:
+            start = next(
+                (i for i, ln in enumerate(lines) if format in ln.strip().lower()),
+                None,
+            )
+            if start is None:
+                rendered = "\n".join(lines[:40]).strip()
+            else:
+                rendered = "\n".join(lines[start : start + 120]).strip()
+    else:  # "brief" and anything unrecognised
+        if not structured:
+            rendered = "\n".join(lines[:40]).strip()
+        else:
+            keep: list[str] = []
+            dropped: list[str] = []
+            for heading, body in sections:
+                if not heading or heading.lower().startswith(("syntax", "description")):
+                    keep.extend(body)
+                else:
+                    dropped.append(heading)
+            rendered = "\n".join(keep).strip()
+            if dropped:
+                rendered += (
+                    "\n\n_Omitted sections: "
+                    + ", ".join(dropped)
+                    + '. Re-request with format="options", "examples", or "full"._'
+                )
+
+    budget = _help_budget()
+    if not budget:
+        return rendered
+    return _truncate_text(
+        rendered,
+        limit=budget,
+        hint='Re-request with a narrower format= ("syntax", "options", "examples") or a more specific topic',
+    ) or ""
 
 
 _STDIN_DETACHED = False
@@ -751,12 +827,19 @@ def _artifact_refs_from_result(result: CommandResponse) -> list[ArtifactRef]:
     return refs
 
 
-def _truncate_text(text: str | None, limit: int = 5000) -> str | None:
+def _truncate_text(
+    text: str | None,
+    limit: int = 5000,
+    hint: str = "Use stata_read_log for full output",
+) -> str | None:
     """Shorten *text* to *limit* characters, keeping both ends.
 
     Stata output carries the echoed command and any error message at the top
     and the results table at the bottom, so a tail-only window can drop the
     very lines that say what ran. Keep a head as well as a tail.
+
+    *hint* names the cheaper way to reach the rest, and differs by caller:
+    command output is recoverable from the log, help text is not.
     """
     if not text or len(text) <= limit:
         return text
@@ -765,7 +848,7 @@ def _truncate_text(text: str | None, limit: int = 5000) -> str | None:
     return (
         text[:head_chars]
         + f"\n... [truncated: {len(text)} total characters, showing the first "
-        f"{head_chars} and the last {tail_chars}. Use stata_read_log for full output] ...\n"
+        f"{head_chars} and the last {tail_chars}. {hint}] ...\n"
         + text[-tail_chars:]
     )
 
@@ -1162,7 +1245,7 @@ async def stata_run(
 
     Returns:
         For sync calls: The execution output (JSON or raw text). Note: the return
-            value is truncated to the tail (max 5,000 chars) for token efficiency.
+            value keeps the head and tail (max 5,000 chars) for token efficiency.
             Use `stata_read_log` on the provided `log_path` for full execution details.
         For background calls: A JSON object containing `task_id` and initial status.
             You MUST call stata_task_status(wait=True) immediately after receiving this.
@@ -1887,15 +1970,20 @@ async def stata_get_help(
     topic: str,
     plain_text: bool = False,
     merge_paragraphs: bool = True,
-    format: str = "full",
+    format: str = "brief",
     session_id: str = "default",
     as_json: bool = False,
     legacy_text: bool = False,
 ) -> ToolEnvelope | str:
     """Returns help for a Stata command.
-    
+
     Args:
         topic: The command or topic to get help for.
+        format: How much of the page to return. "brief" (default) is syntax plus
+            description and lists the sections it omitted; "syntax", "options" and
+            "examples" return one section; "full" returns the whole page. Every mode
+            is capped at 4,000 characters — a full page can exceed 40,000, so start
+            with "brief" and re-request a section only when you need it.
         plain_text: If True, returns plain text instead of Markdown.
         merge_paragraphs: If True, merges fixed-width split paragraphs.
         session_id: The ID of the Stata session.
