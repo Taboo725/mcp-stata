@@ -752,12 +752,21 @@ def _artifact_refs_from_result(result: CommandResponse) -> list[ArtifactRef]:
 
 
 def _truncate_text(text: str | None, limit: int = 5000) -> str | None:
+    """Shorten *text* to *limit* characters, keeping both ends.
+
+    Stata output carries the echoed command and any error message at the top
+    and the results table at the bottom, so a tail-only window can drop the
+    very lines that say what ran. Keep a head as well as a tail.
+    """
     if not text or len(text) <= limit:
         return text
+    head_chars = limit // 3
+    tail_chars = limit - head_chars
     return (
-        f"\n... [truncated: {len(text)} total characters, showing tail only. "
-        "Use stata_read_log for full output] ...\n"
-        + text[-limit:]
+        text[:head_chars]
+        + f"\n... [truncated: {len(text)} total characters, showing the first "
+        f"{head_chars} and the last {tail_chars}. Use stata_read_log for full output] ...\n"
+        + text[-tail_chars:]
     )
 
 
