@@ -408,7 +408,18 @@ async def stata_manage_session(
             )
             pkg_result = CommandResponse.model_validate(pkg_result_dict)
             info["packages"] = pkg_result.stdout
-            info["package_summary"] = _package_summary(pkg_result.stdout)
+            # `ado` lists what was net-installed; ask Stata to resolve the
+            # commands themselves for what is actually callable.
+            probe_dict = await stata_session.call(
+                "run_command_structured",
+                {
+                    "code": _package_probe_code(_package_targets()),
+                    "strip_smcl": True,
+                    "options": {"echo": False},
+                },
+            )
+            probe_result = CommandResponse.model_validate(probe_dict)
+            info["package_summary"] = _package_summary(probe_result.stdout)
         envelope = _build_envelope(
             tool="stata_manage_session",
             success=True,
@@ -2115,23 +2126,63 @@ def _classify_command_risk(code: str) -> dict[str, Any]:
     return {"risk_level": risk_level, "categories": categories}
 
 
-def _package_summary(ado_output: str | None) -> dict[str, bool]:
-    text = (ado_output or "").lower()
-    targets = [
-        "reghdfe",
-        "ivreghdfe",
-        "estout",
-        "outreg2",
-        "coefplot",
-        "gtools",
-        "ftools",
-        "boottest",
-        "rdrobust",
-        "csdid",
-        "eventstudyinteract",
-        "ppmlhdfe",
-    ]
-    return {name: bool(re.search(rf"\b{name}\b", text)) for name in targets}
+EXTRA_PACKAGES_ENV = "MCP_STATA_EXTRA_PACKAGES"
+
+_DEFAULT_PACKAGE_TARGETS = (
+    "reghdfe",
+    "ivreghdfe",
+    "estout",
+    "outreg2",
+    "coefplot",
+    "gtools",
+    "ftools",
+    "boottest",
+    "rdrobust",
+    "csdid",
+    "eventstudyinteract",
+    "ppmlhdfe",
+)
+
+_PACKAGE_PROBE_TAG = "mcp_pkg:"
+_PACKAGE_PROBE_RE = re.compile(rf"{_PACKAGE_PROBE_TAG}(\w+)=([01])")
+# Names are interpolated into Stata code, so accept plain identifiers only.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _package_targets() -> list[str]:
+    """Commands to probe: the built-in list plus ``MCP_STATA_EXTRA_PACKAGES``."""
+    targets = list(_DEFAULT_PACKAGE_TARGETS)
+    for name in re.split(r"[,;\s]+", os.environ.get(EXTRA_PACKAGES_ENV, "")):
+        if name and name not in targets and _PACKAGE_NAME_RE.match(name):
+            targets.append(name)
+    return targets
+
+
+def _package_probe_code(targets: list[str]) -> str:
+    """Stata code printing ``mcp_pkg:<name>=<0|1>`` for each target command."""
+    return (
+        f"foreach __mcp_pkg in {' '.join(targets)} {{\n"
+        "    capture which `__mcp_pkg'\n"
+        "    local __mcp_rc = _rc\n"
+        f"    display \"{_PACKAGE_PROBE_TAG}`__mcp_pkg'=\" (`__mcp_rc' == 0)\n"
+        "}\n"
+    )
+
+
+def _package_summary(probe_output: str | None) -> dict[str, bool]:
+    """Map each probed command to whether Stata can resolve it.
+
+    Detection asks Stata to resolve the command (``capture which``) rather than
+    grepping ``ado dir``. ``ado dir`` reports only packages holding an entry in
+    an ado directory's ``stata.trk``, so a package whose files are installed but
+    whose tracking entry is absent — copied in by hand, installed while PLUS
+    pointed elsewhere, or left behind by a reset ``stata.trk`` — reads as
+    missing even though every one of its commands runs.
+    """
+    found = {
+        name: flag == "1" for name, flag in _PACKAGE_PROBE_RE.findall(probe_output or "")
+    }
+    return {name: found.get(name, False) for name in _package_targets()}
 
 
 async def _list_variables_for_session(session_id: str) -> list[dict[str, Any]]:
