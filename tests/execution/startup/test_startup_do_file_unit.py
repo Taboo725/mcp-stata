@@ -277,8 +277,11 @@ class TestReloadStartupDoFiles(unittest.TestCase):
         self.client._reload_startup_do_files()
 
         calls = [call[0][0] for call in mock_stata.run.call_args_list]
-        profile_calls = [c for c in calls if 'capture noisily do' in c and 'profile.do' in c]
+        # The reload runs inside a user command, so it must use the silent
+        # 'capture run' form; 'do' echoes the whole file into that output.
+        profile_calls = [c for c in calls if 'capture run' in c and 'profile.do' in c]
         self.assertEqual(len(profile_calls), 1)
+        self.assertEqual([c for c in calls if 'noisily do' in c and 'profile.do' in c], [])
 
     @patch('mcp_stata.stata_client.os.getenv')
     def test_reload_installs_sentinel(self, mock_getenv):

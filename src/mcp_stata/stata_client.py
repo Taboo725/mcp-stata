@@ -1840,7 +1840,7 @@ class StataClient:
             logger.error(msg)
             raise RuntimeError(msg) from e
 
-    def _load_startup_do_file(self) -> None:
+    def _load_startup_do_file(self, quiet: bool = False) -> None:
         """Load startup .do files matching native Stata behavior.
 
         Execution order:
@@ -1850,8 +1850,17 @@ class StataClient:
         3. First ``profile.do`` found along the Stata search path.
 
         All paths are deduplicated so the same file is never executed twice.
+
+        With *quiet* the files are executed with ``run`` rather than ``do``.
+        ``do`` echoes every line of the file it executes, and on a reload
+        triggered mid-command (see :meth:`_reload_startup_do_files`) that echo
+        lands in the user's own command output. ``run`` is the silent form.
         """
         loaded_paths: set[str] = set()
+        verb = "run" if quiet else "do"
+        # ``noisily`` would defeat the point of ``run``; keep ``capture`` either
+        # way so a broken profile.do cannot take the session down.
+        capture = "capture" if quiet else "capture noisily"
 
         # Phase 0: Internal statest support
         statest_mata = os.path.join(os.path.dirname(__file__), "statest", "statest.mata")
@@ -1859,8 +1868,13 @@ class StataClient:
         if os.path.exists(statest_mata):
             logger.debug("Injecting internal statest.mata")
             try:
-                # Use 'do' for reliability
-                self.stata.run(f'do {self._stata_quote(statest_mata)}', echo=False)
+                # Use 'do'/'run' for reliability. On a quiet reload the Mata
+                # functions may already exist (``program drop _all`` does not
+                # clear Mata), so capture the resulting r(3000) as well.
+                statest_cmd = f'{verb} {self._stata_quote(statest_mata)}'
+                if quiet:
+                    statest_cmd = f'capture {statest_cmd}'
+                self.stata.run(statest_cmd, echo=False)
                 loaded_paths.add(self._normalize_startup_path(statest_mata))
             except Exception as e:
                 logger.error("Failed to inject internal statest.mata: %s", e)
@@ -1891,7 +1905,7 @@ class StataClient:
                 try:
                     # Run with noisily so output lands in the session log.
                     self.stata.run(
-                        f'capture noisily do {self._stata_quote(path)}',
+                        f'{capture} {verb} {self._stata_quote(path)}',
                         echo=False,
                     )
                 except Exception as e:
@@ -1910,7 +1924,7 @@ class StataClient:
                 logger.info("Loading sysprofile.do from %s", self._sysprofile_do_path)
                 try:
                     self.stata.run(
-                        f'capture noisily do {self._stata_quote(self._sysprofile_do_path)}',
+                        f'{capture} {verb} {self._stata_quote(self._sysprofile_do_path)}',
                         echo=False,
                     )
                 except Exception as e:
@@ -1926,7 +1940,7 @@ class StataClient:
                 logger.info("Loading profile.do from %s", self._profile_do_path)
                 try:
                     self.stata.run(
-                        f'capture noisily do {self._stata_quote(self._profile_do_path)}',
+                        f'{capture} {verb} {self._stata_quote(self._profile_do_path)}',
                         echo=False,
                     )
                 except Exception as e:
@@ -2179,7 +2193,9 @@ class StataClient:
             pass
 
         # _load_startup_do_file already calls _install_startup_sentinel at end.
-        self._load_startup_do_file()
+        # quiet=True: this runs inside the user's command, so the startup files
+        # must not echo themselves into that command's output.
+        self._load_startup_do_file(quiet=True)
 
         # Restore the original c(rc).
         try:
@@ -2984,11 +3000,18 @@ class StataClient:
                     except Exception: pass
                     delattr(self, "_hold_name")
 
+                # Read the log before reloading: the reload writes to the same
+                # log, so anything the startup files emit would otherwise be
+                # appended to this command's own output.
+                try:
+                    smcl_content = self._read_persistent_log_chunk(start_off) if use_p else self._read_smcl_file(smcl_path)
+                except Exception:
+                    smcl_content = ""
+
                 # Re-run startup .do files when programs have been dropped.
                 self._maybe_reload_startup_after_command(code)
 
         # Output extraction
-        smcl_content = self._read_persistent_log_chunk(start_off) if use_p else self._read_smcl_file(smcl_path)
         if use_p and not smcl_content:
             try:
                 self.stata.run(f"capture quietly log flush {self._persistent_log_name}", echo=False)
@@ -3496,14 +3519,18 @@ class StataClient:
         finally:
             tee.close()
 
-        # Re-run startup .do files when programs have been dropped.
-        self._maybe_reload_startup_after_command(code)
-
         # Read SMCL content as the authoritative source
         if self._break_requested:
             smcl_content = tail.get_value()
         else:
             smcl_content = self._read_smcl_file(smcl_path, start_offset=start_offset)
+
+        # Re-run startup .do files when programs have been dropped. This has to
+        # happen *after* the log has been read: the reload appends to the same
+        # SMCL log, and the next command reads from a fresh offset, so anything
+        # the startup files emit would otherwise be tacked onto this command's
+        # own output (and, with tail-only truncation, push it out entirely).
+        self._maybe_reload_startup_after_command(code)
         # Clean internal maintenance immediately
         smcl_content = self._clean_internal_smcl(smcl_content, strip_output=False)
 
@@ -3818,17 +3845,18 @@ class StataClient:
         finally:
             tee.close()
 
-        # For do-files we cannot reliably parse the file content for
-        # program-clearing commands, so we use a lightweight check: see
-        # whether a sentinel program we previously loaded still exists.
-        # If the startup files defined no programs this is a no-op.
-        self._maybe_reload_startup_after_do_file()
-
         # Read SMCL content as the authoritative source
         if self._break_requested:
             smcl_content = tail.get_value()
         else:
             smcl_content = self._read_smcl_file(smcl_path, start_offset=start_offset)
+
+        # For do-files we cannot reliably parse the file content for
+        # program-clearing commands, so we use a lightweight check: see
+        # whether a sentinel program we previously loaded still exists.
+        # If the startup files defined no programs this is a no-op.
+        # Reloaded after the read, for the same reason as in run_command.
+        self._maybe_reload_startup_after_do_file()
         # Clean internal maintenance immediately
         smcl_content = self._clean_internal_smcl(smcl_content, strip_output=False)
 
