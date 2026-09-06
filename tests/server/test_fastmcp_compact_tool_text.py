@@ -14,8 +14,26 @@ async def _structured_fixture_tool() -> ToolEnvelope:
     raise RuntimeError("not invoked in these tests")
 
 
-def test_convert_result_omits_duplicate_unstructured_json_by_default(monkeypatch):
+def test_convert_result_keeps_a_compact_companion_by_default(monkeypatch):
+    """The default is ``compact``, not ``omit``: hosts that only read
+    ``content[]`` still get the payload, on one line."""
     monkeypatch.delenv(STRUCTURED_COMPANION_ENV, raising=False)
+    env = ToolEnvelope(
+        tool="stata_run",
+        success=True,
+        session_id="default",
+        data={"command": "sysuse auto", "rc": 0},
+    )
+    tool = Tool.from_function(_structured_fixture_tool, structured_output=True)
+    converted = tool.fn_metadata.convert_result(env.model_dump())
+    assert isinstance(converted, tuple)
+    unstructured, structured = converted
+    assert structured["tool"] == "stata_run"
+    assert "\n" not in unstructured[0].text
+
+
+def test_convert_result_omits_duplicate_unstructured_json_on_request(monkeypatch):
+    monkeypatch.setenv(STRUCTURED_COMPANION_ENV, "omit")
     env = ToolEnvelope(
         tool="stata_run",
         success=True,
