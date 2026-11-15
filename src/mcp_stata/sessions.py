@@ -50,6 +50,7 @@ class StataSession:
         self._history: List[_SessionSnapshot] = []
         self._last_diff_snapshot: Optional[_SessionSnapshot] = None
         self._history_lock = asyncio.Lock()
+        self._stopping = False
         
         self._parent_conn, self._child_conn = Pipe()
         self._process = Process(target=self._run_worker, args=(self._child_conn, startup_do_file))
@@ -71,17 +72,27 @@ class StataSession:
 
     async def _listen_to_worker(self):
         loop = asyncio.get_running_loop()
+        connection_closed = False
         try:
             while self._listener_running:
                 # Use poll with timeout to allow checking self._listener_running and asyncio cancellation
-                if await loop.run_in_executor(None, self._parent_conn.poll, 0.2):
-                    try:
-                        msg = await loop.run_in_executor(None, self._parent_conn.recv)
-                        await self._handle_worker_msg(msg)
-                    except (EOFError, ConnectionResetError, BrokenPipeError):
-                        logger.info(f"Session {self.id} worker connection closed.")
-                        break
+                try:
+                    ready = await loop.run_in_executor(None, self._parent_conn.poll, 0.2)
+                    msg = await loop.run_in_executor(None, self._parent_conn.recv) if ready else None
+                except (EOFError, OSError):
+                    logger.info(f"Session {self.id} worker connection closed.")
+                    connection_closed = True
+                    break
+                if ready:
+                    await self._handle_worker_msg(msg)
                 else:
+                    # The parent keeps its own copy of the child's pipe end, so
+                    # a worker that dies (crash, OOM kill, taskkill) does not
+                    # always surface as EOF. Check liveness directly.
+                    if self._pending_requests and not self._worker_alive():
+                        logger.warning(f"Session {self.id} worker process is gone.")
+                        connection_closed = True
+                        break
                     # Give the event loop a chance to process other tasks and check cancellation
                     await asyncio.sleep(0.01)
         except asyncio.CancelledError:
@@ -94,6 +105,11 @@ class StataSession:
             self._listener_running = False
             if self.status != "error":
                 self.status = "stopped"
+            # A closed pipe or a dead worker means no result can ever arrive for
+            # what is still pending. Fail it now: otherwise the caller -- and any
+            # background task built on it -- reports "running" forever.
+            if connection_closed or self._stopping or not self._worker_alive():
+                self._fail_pending(self._unavailable_reason())
 
     async def _handle_worker_msg(self, msg: Dict[str, Any]):
         event = msg.get("event")
@@ -105,14 +121,12 @@ class StataSession:
             logger.info(f"Session {self.id} ready (PID: {self.pid})")
         
         elif event == "log":
-            if msg_id in self._log_listeners:
-                for cb in self._log_listeners[msg_id]:
-                    await cb(msg.get("text"))
+            for cb in list(self._log_listeners.get(msg_id, ())):
+                await self._invoke_listener(cb, msg.get("text"))
         
         elif event == "progress":
-            if msg_id in self._progress_listeners:
-                for cb in self._progress_listeners[msg_id]:
-                    await cb(msg.get("progress"), msg.get("total"), msg.get("message"))
+            for cb in list(self._progress_listeners.get(msg_id, ())):
+                await self._invoke_listener(cb, msg.get("progress"), msg.get("total"), msg.get("message"))
         
         elif event == "result":
             if msg_id in self._pending_requests:
@@ -137,6 +151,36 @@ class StataSession:
                     if not fut.done():
                         fut.set_exception(RuntimeError(f"Worker process failed: {error_msg}"))
                     self._cleanup_listeners(pid)
+
+    async def _invoke_listener(self, cb, *args) -> None:
+        # A failing log/progress consumer must not take the session listener
+        # down with it; that would strand every pending request.
+        try:
+            await cb(*args)
+        except Exception as e:
+            logger.warning(f"Session {self.id} listener callback failed: {e}")
+
+    def _worker_alive(self) -> bool:
+        try:
+            return bool(self._process and self._process.is_alive())
+        except Exception:
+            return False
+
+    def _unavailable_reason(self) -> str:
+        if self._stopping:
+            return f"Stata session {self.id} was stopped before the command finished."
+        exitcode = getattr(self._process, "exitcode", None)
+        detail = f" (exit code {exitcode})" if exitcode is not None else ""
+        return (
+            f"Stata worker for session {self.id} exited unexpectedly{detail} before the command "
+            f"finished. The session will be rebuilt on the next call."
+        )
+
+    def _fail_pending(self, message: str) -> None:
+        for msg_id, fut in list(self._pending_requests.items()):
+            if not fut.done():
+                fut.set_exception(RuntimeError(message))
+            self._cleanup_listeners(msg_id)
 
     def _cleanup_listeners(self, msg_id: str):
         self._log_listeners.pop(msg_id, None)
@@ -364,6 +408,7 @@ class StataSession:
             raise RuntimeError(f"Failed to send break signal: {e}")
 
     async def stop(self, timeout: float = 5.0):
+        self._stopping = True
         self._listener_running = False
         if self.status != "stopped":
             try:
@@ -392,6 +437,7 @@ class StataSession:
             self._history.clear()
             self._last_diff_snapshot = None
             self.status = "stopped"
+            self._fail_pending(self._unavailable_reason())
             if self._listener_task:
                 self._listener_task.cancel()
                 try:
