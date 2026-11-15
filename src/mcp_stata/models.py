@@ -111,7 +111,7 @@ class SessionListResponse(BaseModel):
 
 class TaskResult(BaseModel):
     task_id: str
-    status: Literal["started", "running", "done", "failed", "timeout", "not_found", "cancelling"]
+    status: Literal["started", "queued", "running", "done", "failed", "timeout", "not_found", "cancelling"]
     kind: Optional[str] = None
     created_at: Optional[str] = None
     result: Any = None

@@ -810,6 +810,14 @@ def _auto_background_after() -> float:
     return _env_seconds(AUTO_BACKGROUND_ENV, _DEFAULT_AUTO_BACKGROUND_AFTER)
 
 
+def _busy_session_warning(session_id: str, behind: str) -> str:
+    return (
+        f"Session '{session_id}' is busy with {behind}; this run waits until it finishes. "
+        f"Stata runs one command at a time per session -- use a different session_id "
+        f"to run independent jobs in parallel."
+    )
+
+
 def _task_worker(task_info: BackgroundTask) -> tuple[Optional[bool], Optional[int]]:
     """(alive, pid) of the worker a task runs on, when known."""
     worker = task_info.worker_session
@@ -823,12 +831,40 @@ def _task_worker(task_info: BackgroundTask) -> tuple[Optional[bool], Optional[in
         return None, None
 
 
+def _task_queue_state(task_info: BackgroundTask) -> Optional[dict[str, Any]]:
+    """``{"position", "executing"}`` while the task waits in its worker's queue."""
+    if task_info.done or task_info.worker_session is None:
+        return None
+    probe = getattr(task_info.worker_session, "queue_state", None)
+    if not callable(probe):
+        return None
+    try:
+        state = probe(task_info.task_id)
+    except Exception:
+        return None
+    return state if isinstance(state, dict) and state.get("position", 0) > 0 else None
+
+
+def _describe_request(label: Optional[str]) -> str:
+    if label and label in _background_tasks:
+        return f"task {label}"
+    return f"another request ({label})" if label else "another request"
+
+
 async def _task_progress_snapshot(task_info: BackgroundTask, status: str) -> dict[str, Any]:
     record = task_info.progress
+    queued = _task_queue_state(task_info) if status in {"running", "started", "queued"} else None
+    if queued:
+        return task_progress.build_snapshot(
+            record,
+            status="queued",
+            worker_alive=_task_worker(task_info)[0],
+            queued_behind=_describe_request(queued.get("executing")),
+        )
     alive, pid = (None, None) if task_info.done else _task_worker(task_info)
     cpu = None
     if not task_info.done and alive:
-        reference = record.last_output_mono or record.started_mono
+        reference = record.last_output_mono or record.exec_started_mono or record.started_mono
         # CPU is only worth a sample once the task has gone quiet: it is what
         # tells a silent long estimation apart from a hung session.
         if time.monotonic() - reference >= task_progress.stall_seconds():
@@ -1005,7 +1041,12 @@ def _format_command_result(result: CommandResponse, raw: bool, as_json: bool, se
 
 
 async def _wait_for_log_path(task_info: BackgroundTask) -> None:
+    # The log path only appears once the command starts executing. If the
+    # session is busy that may be hours away: return as soon as the task is
+    # known to be queued instead of blocking the "background" call on it.
     while task_info.log_path is None and not task_info.done:
+        if _task_queue_state(task_info) is not None:
+            return
         await anyio.sleep(0.01)
 
 
@@ -1157,6 +1198,8 @@ async def stata_task_status(
             status = "running"
             if task_info.done:
                 status = "failed" if task_info.error else "done"
+            elif _task_queue_state(task_info) is not None:
+                status = "queued"
             
             res = {
                 "task_id": task_id,
@@ -1175,7 +1218,7 @@ async def stata_task_status(
             if status == "failed" and tail_lines <= 0:
                 res["error_tail"] = _tail_file(task_info.log_path, 10)
 
-            if not task_info.done and wait and (time.time() - start_time >= timeout):
+            if not task_info.done and wait and (time.time() - start_time >= timeout) and status != "queued":
                 res["status"] = "timeout"
                 res["error"] = f"Task did not complete within {timeout:g} seconds; it is still running."
             res["progress"] = await _task_progress_snapshot(task_info, status)
@@ -1190,10 +1233,10 @@ async def stata_task_status(
                 )
             envelope = _build_envelope(
                 tool="stata_task_status",
-                success=status in {"running", "done"},
+                success=status in {"running", "queued", "done"},
                 data=res,
                 error=task_info.error_details if task_info.error_details else (
-                    ErrorEnvelope(message=res["error"]) if res.get("error") and status not in {"running", "done"} else None
+                    ErrorEnvelope(message=res["error"]) if res.get("error") and status not in {"running", "queued", "done"} else None
                 ),
                 log_path=task_info.log_path,
                 log_tail=res.get("tail") or res.get("error_tail"),
@@ -1493,6 +1536,7 @@ async def stata_run(
             params,
             notify_log=tracked_log,
             notify_progress=tracked_progress,
+            label=task_id,
         )
         return CommandResponse.model_validate(result_dict)
 
@@ -1544,11 +1588,17 @@ async def stata_run(
             task_info.task.add_done_callback(_finalize_if_never_started)
         _register_task(task_info)
         await _wait_for_log_path(task_info)
+        queued = _task_queue_state(task_info)
+        submit_data = TaskResult(task_id=task_id, status="queued" if queued else "started").model_dump()
+        submit_data["log_path"] = task_info.log_path
+        if queued:
+            submit_data["queued_behind"] = _describe_request(queued.get("executing"))
+            warnings = warnings + [_busy_session_warning(session_id, submit_data["queued_behind"])]
         envelope = _build_envelope(
             tool="stata_run",
             success=True,
             session_id=session_id,
-            data=TaskResult(task_id=task_id, status="started").model_dump() | {"log_path": task_info.log_path},
+            data=submit_data,
             log_path=task_info.log_path,
             warnings=warnings,
             next_actions=[
@@ -1580,6 +1630,8 @@ async def stata_run(
             task_info.task.add_done_callback(lambda t: _finalize_if_never_started(t, running))
             _register_task(task_info)
             snapshot = await _task_progress_snapshot(task_info, "running")
+            if snapshot.get("state") == "queued":
+                warnings = warnings + [_busy_session_warning(session_id, snapshot.get("queued_behind", "another request"))]
             envelope = _build_envelope(
                 tool="stata_run",
                 success=True,

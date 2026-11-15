@@ -301,7 +301,7 @@ class _ScriptedSession:
         self._process = _FakeProcess()
         self.cancelled = False
 
-    async def call(self, method, params, notify_log=None, notify_progress=None):
+    async def call(self, method, params, notify_log=None, notify_progress=None, **_kw):
         try:
             await notify_log(json.dumps({"event": "log_path", "path": "fake.smcl"}))
             for i in range(1, self.total_lines + 1):

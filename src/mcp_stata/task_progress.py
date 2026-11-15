@@ -57,6 +57,8 @@ class TaskProgress:
     """Mutable progress record for one execution."""
 
     started_mono: float = field(default_factory=time.monotonic)
+    # When the worker actually began executing; earlier time was spent queued.
+    exec_started_mono: Optional[float] = None
     finished_mono: Optional[float] = None
     progress: Optional[float] = None
     total: Optional[float] = None
@@ -76,6 +78,7 @@ class TaskProgress:
             if text.lstrip().startswith(_EVENT_PREFIX):
                 return
             self.last_output_mono = time.monotonic()
+            self._mark_executing()
             self.output_chars += len(text)
             seen_line = False
             for raw in reversed(text.splitlines()):
@@ -92,7 +95,12 @@ class TaskProgress:
         except Exception:
             pass
 
+    def _mark_executing(self) -> None:
+        if self.exec_started_mono is None:
+            self.exec_started_mono = time.monotonic()
+
     def observe_progress(self, progress: Any, total: Any, message: Any) -> None:
+        self._mark_executing()
         try:
             self.progress = float(progress) if progress is not None else None
             self.total = float(total) if total is not None else None
@@ -213,9 +221,14 @@ def build_snapshot(
         snap["lines_total"] = int(record.total)
         snap["percent"] = round(100.0 * record.progress / record.total, 1)
 
+    if record.exec_started_mono is not None:
+        waited = record.exec_started_mono - record.started_mono
+        if waited >= 1.0:
+            snap["queued_s"] = round(waited, 1)
+
     quiet_for: Optional[float] = None
-    if record.finished_mono is None:
-        reference = record.last_output_mono or record.started_mono
+    if record.finished_mono is None and status != "queued":
+        reference = record.last_output_mono or record.exec_started_mono or record.started_mono
         quiet_for = max(0.0, now - reference)
         snap["quiet_for_s"] = round(quiet_for, 1)
     if record.current_command:
@@ -263,7 +276,7 @@ def _summary(status: str, snap: dict[str, Any]) -> str:
     if "worker_cpu_percent" in snap:
         parts.append(f"cpu {snap['worker_cpu_percent']:.0f}%")
     if snap.get("queued_behind"):
-        parts.append(f"waiting for task {snap['queued_behind']}")
+        parts.append(f"waiting for {snap['queued_behind']}")
     if snap.get("current_command") and state not in {"done", "failed", "queued"}:
         parts.append(f"now: {snap['current_command']}")
     return " · ".join(parts)

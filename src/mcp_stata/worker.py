@@ -24,6 +24,8 @@ class StataWorker:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self._command_queue = queue.Queue()
+        # Ids of queued requests the parent withdrew before they started.
+        self._cancelled_ids: set[str] = set()
         self._is_running = True
         self.profile_code: Optional[str] = None
         self.startup_do_file = startup_do_file
@@ -44,6 +46,13 @@ class StataWorker:
                         if self.client:
                             self.client._request_break_in()
                         # We don't put 'break' in the command queue; it's handled immediately.
+                    elif msg_type == "cancel":
+                        # Out-of-band withdrawal of a request that is still
+                        # queued. Unlike "break" it must not touch whatever
+                        # is executing now -- that is someone else's command.
+                        target = msg.get("target")
+                        if target:
+                            self._cancelled_ids.add(target)
                     elif msg_type == "stop":
                         self._is_running = False
                         self._command_queue.put(msg)
@@ -82,6 +91,14 @@ class StataWorker:
                     msg = self._command_queue.get(timeout=0.1)
                     if msg.get("type") == "stop":
                         break
+                    if msg.get("id") in self._cancelled_ids:
+                        self._cancelled_ids.discard(msg.get("id"))
+                        self.conn.send({
+                            "event": "error",
+                            "id": msg.get("id"),
+                            "message": "Cancelled while queued; it never started.",
+                        })
+                        continue
                     
                     # Handle command
                     self.loop.run_until_complete(self.handle_message(msg))

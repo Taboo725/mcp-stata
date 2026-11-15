@@ -58,6 +58,10 @@ class StataSession:
         self._process.start()
         
         self._pending_requests: Dict[str, asyncio.Future] = {}
+        # Requests the worker has not finished, in send order. The worker runs
+        # them one at a time, first in first out, so the head is executing and
+        # the rest are queued behind it.
+        self._inflight: Dict[str, str] = {}
         self._log_listeners: Dict[str, List[Callable[[str], Awaitable[None]]]] = {}
         self._progress_listeners: Dict[str, List[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]]] = {}
         
@@ -129,12 +133,14 @@ class StataSession:
                 await self._invoke_listener(cb, msg.get("progress"), msg.get("total"), msg.get("message"))
         
         elif event == "result":
+            self._inflight_map().pop(msg_id, None)
             if msg_id in self._pending_requests:
                 if not self._pending_requests[msg_id].done():
                     self._pending_requests[msg_id].set_result(msg.get("result"))
                 self._cleanup_listeners(msg_id)
         
         elif event == "error":
+            self._inflight_map().pop(msg_id, None)
             if msg_id in self._pending_requests:
                 if not self._pending_requests[msg_id].done():
                     self._pending_requests[msg_id].set_exception(RuntimeError(msg.get("message")))
@@ -176,7 +182,35 @@ class StataSession:
             f"finished. The session will be rebuilt on the next call."
         )
 
+    def _inflight_map(self) -> Dict[str, str]:
+        inflight = self.__dict__.get("_inflight")
+        if inflight is None:
+            inflight = self._inflight = {}
+        return inflight
+
+    def _executing_id(self) -> Optional[str]:
+        return next(iter(self._inflight_map()), None)
+
+    def queue_state(self, label: str) -> Optional[Dict[str, Any]]:
+        """Where the request tagged *label* stands in this worker's queue.
+
+        Returns ``None`` when it is not in flight, otherwise ``position``
+        (0 = executing, n = n requests ahead) and the label of the request
+        currently executing.
+        """
+        entries = list(self._inflight_map().values())
+        for position, entry in enumerate(entries):
+            if entry == label:
+                return {"position": position, "executing": entries[0]}
+        return None
+
+    def busy_with(self) -> Optional[str]:
+        """Label of the request executing now, or ``None`` when idle."""
+        entries = list(self._inflight_map().values())
+        return entries[0] if entries else None
+
     def _fail_pending(self, message: str) -> None:
+        self._inflight_map().clear()
         for msg_id, fut in list(self._pending_requests.items()):
             if not fut.done():
                 fut.set_exception(RuntimeError(message))
@@ -202,6 +236,7 @@ class StataSession:
         notify_log: Optional[Callable[[str], Awaitable[None]]] = None,
         notify_progress: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None,
         timeout_seconds: Optional[float] = None,
+        label: Optional[str] = None,
     ) -> Any:
         await self._ensure_listener()
         if self.status == "error":
@@ -216,6 +251,7 @@ class StataSession:
         if notify_progress:
             self._progress_listeners.setdefault(msg_id, []).append(notify_progress)
 
+        self._inflight_map()[msg_id] = label or method
         try:
             self._parent_conn.send({
                 "type": method,
@@ -233,10 +269,17 @@ class StataSession:
                 ) from e
         except asyncio.CancelledError:
             logger.info(f"Cancellation requested for command {method}:{msg_id} in session {self.id}")
+            # Break interrupts whatever Stata is executing. Only send it when
+            # that is this request; a request still waiting in the queue is
+            # withdrawn instead, so cancelling it cannot kill the job ahead.
+            executing = self._executing_id() == msg_id
             try:
-                self._parent_conn.send({"type": "break"})
+                if executing:
+                    self._parent_conn.send({"type": "break"})
+                else:
+                    self._parent_conn.send({"type": "cancel", "target": msg_id})
             except Exception as e:
-                logger.warning(f"Failed to send break command to worker for session {self.id}: {e}")
+                logger.warning(f"Failed to send cancellation to worker for session {self.id}: {e}")
 
             try:
                 await asyncio.wait_for(asyncio.shield(future), timeout=3.0)
@@ -246,6 +289,7 @@ class StataSession:
             raise
         except (AttributeError, BrokenPipeError, ConnectionResetError) as e:
             self._cleanup_listeners(msg_id)
+            self._inflight_map().pop(msg_id, None)
             raise RuntimeError(f"Failed to send command to worker: {e}")
 
     async def _collect_snapshot(self, command_count: int) -> _SessionSnapshot:
@@ -370,12 +414,14 @@ class StataSession:
 
     async def call(self, method: str, args: Dict[str, Any], 
                    notify_log: Optional[Callable[[str], Awaitable[None]]] = None,
-                   notify_progress: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None) -> Any:
+                   notify_progress: Optional[Callable[[float, Optional[float], Optional[str]], Awaitable[None]]] = None,
+                   label: Optional[str] = None) -> Any:
         result = await self._call_raw(
             method,
             args,
             notify_log=notify_log,
             notify_progress=notify_progress,
+            label=label,
         )
 
         if method in self._STATEFUL_METHODS:
