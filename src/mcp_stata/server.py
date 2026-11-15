@@ -2,7 +2,7 @@ from __future__ import annotations
 import anyio
 import asyncio
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from mcp.server.fastmcp import Context, FastMCP
@@ -52,6 +52,7 @@ from .toolkit_catalog_data import SKILLS, SKILL_BY_ID, CHECKLISTS
 from .statest import runner as statest_runner
 from .fastmcp_schema_slim import install_slim_tool_schemas
 from .fastmcp_text_compact import install_compact_fastmcp_tool_text
+from . import task_progress
 
 
 
@@ -521,6 +522,9 @@ class BackgroundTask:
     error: Optional[str] = None
     error_details: Optional[ErrorEnvelope] = None
     done: bool = False
+    progress: task_progress.TaskProgress = field(default_factory=task_progress.TaskProgress)
+    # The session object the task actually ran on, for liveness/CPU probes.
+    worker_session: Any = None
 
 
 _background_tasks: Dict[str, BackgroundTask] = {}
@@ -779,6 +783,57 @@ def _install_stdout_filter() -> None:
         t.start()
     except Exception:
         _STDOUT_FILTER_INSTALLED = False
+
+
+TASK_WAIT_MAX_ENV = "MCP_STATA_TASK_WAIT_MAX"
+_DEFAULT_TASK_WAIT_MAX = 120.0
+AUTO_BACKGROUND_ENV = "MCP_STATA_AUTO_BACKGROUND_AFTER"
+_DEFAULT_AUTO_BACKGROUND_AFTER = 60.0
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """Non-negative seconds from *name*; ``0`` means "disabled"."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _task_wait_cap() -> float:
+    return _env_seconds(TASK_WAIT_MAX_ENV, _DEFAULT_TASK_WAIT_MAX)
+
+
+def _auto_background_after() -> float:
+    return _env_seconds(AUTO_BACKGROUND_ENV, _DEFAULT_AUTO_BACKGROUND_AFTER)
+
+
+def _task_worker(task_info: BackgroundTask) -> tuple[Optional[bool], Optional[int]]:
+    """(alive, pid) of the worker a task runs on, when known."""
+    worker = task_info.worker_session
+    if worker is None:
+        return None, None
+    try:
+        process = getattr(worker, "_process", None)
+        alive = bool(process is not None and process.is_alive())
+        return alive, getattr(process, "pid", None) or getattr(worker, "pid", None)
+    except Exception:
+        return None, None
+
+
+async def _task_progress_snapshot(task_info: BackgroundTask, status: str) -> dict[str, Any]:
+    record = task_info.progress
+    alive, pid = (None, None) if task_info.done else _task_worker(task_info)
+    cpu = None
+    if not task_info.done and alive:
+        reference = record.last_output_mono or record.started_mono
+        # CPU is only worth a sample once the task has gone quiet: it is what
+        # tells a silent long estimation apart from a hung session.
+        if time.monotonic() - reference >= task_progress.stall_seconds():
+            cpu = await task_progress.sample_cpu_percent(record, pid)
+    return task_progress.build_snapshot(record, status=status, worker_alive=alive, cpu_percent=cpu)
 
 
 def _register_task(task_info: BackgroundTask, max_tasks: int = 100) -> None:
@@ -1065,9 +1120,9 @@ async def stata_task_status(
     Args:
         task_id: The unique identifier of the background task to query.
         wait: If True, the call will block until the task finishes or the timeout is reached.
-        timeout: Maximum seconds to wait. Set based on expected runtime: short commands ~30s,
-            typical do-files ~120s, large dataset jobs ~600s. If uncertain, use a moderate
-            value and loop on status='timeout' rather than setting an artificially high ceiling.
+        timeout: Maximum seconds to wait, capped at MCP_STATA_TASK_WAIT_MAX (default 120) so
+            long jobs report back regularly. On status='timeout' the task is still running:
+            relay data.progress.summary to the user and call again.
         poll_interval: Delay between checks (in seconds) when waiting for completion.
         tail_lines: Lines of log to include in the response. Set based on how much output you
             expect: 0 if you plan to call stata_read_log separately, 20-50 for quick
@@ -1075,10 +1130,18 @@ async def stata_task_status(
 
     Returns:
         A JSON object containing task details: status (started, running, done, failed, timeout,
-        not_found), timestamps, log path, and the final result if completed.
+        not_found), timestamps, log path, the final result if completed, and data.progress:
+        elapsed_s, lines_done/lines_total/percent (do-files), current_command, quiet_for_s and
+        a `state` of running, busy_silent (no output but computing), possibly_stuck (no output,
+        idle CPU) or worker_dead.
     """
     _log_tool_call("stata_task_status")
     start_time = time.time()
+    cap = _task_wait_cap()
+    if wait and cap > 0 and timeout > cap:
+        # Return at least every `cap` seconds with a progress snapshot, so a
+        # long job reads as a moving progress report rather than a hung call.
+        timeout = cap
     while True:
         task_info = _background_tasks.get(task_id)
         if task_info is None:
@@ -1114,7 +1177,17 @@ async def stata_task_status(
 
             if not task_info.done and wait and (time.time() - start_time >= timeout):
                 res["status"] = "timeout"
-                res["error"] = f"Task did not complete within {timeout} seconds."
+                res["error"] = f"Task did not complete within {timeout:g} seconds; it is still running."
+            res["progress"] = await _task_progress_snapshot(task_info, status)
+            status_actions: list[str] = []
+            advice = task_progress.stall_advice(res["progress"], task_info.session_id)
+            if advice:
+                status_actions.append(advice)
+            if not task_info.done:
+                status_actions.append(
+                    f"Still running ({res['progress']['summary']}). Tell the user, then call "
+                    f"stata_task_status(task_id='{task_id}', wait=True) again."
+                )
             envelope = _build_envelope(
                 tool="stata_task_status",
                 success=status in {"running", "done"},
@@ -1124,6 +1197,7 @@ async def stata_task_status(
                 ),
                 log_path=task_info.log_path,
                 log_tail=res.get("tail") or res.get("error_tail"),
+                next_actions=status_actions,
             )
             return _envelope_legacy_json(envelope) if as_json else envelope
 
@@ -1237,6 +1311,10 @@ async def stata_run(
     `stata_task_status(task_id=<id>, wait=True, timeout=300, tail_lines=50)` right
     after this tool returns. Loop on that call until `status` is `'done'` or
     `'failed'`. Skipping the follow-up call will stall the conversation.
+
+    A synchronous call still running after MCP_STATA_AUTO_BACKGROUND_AFTER seconds
+    (default 60; 0 disables) returns early with `auto_backgrounded: true` and a
+    `task_id`; follow it with `stata_task_status` exactly as for background mode.
 
     Stata output is captured in real-time and written to a temporary log file.
 
@@ -1376,8 +1454,23 @@ async def stata_run(
             related_request_id=ctx.request_id,
         )
 
+    # Always observe the worker's streams, whether or not the client asked for
+    # notifications: the record behind stata_task_status is built from them.
+    async def tracked_log(text: str) -> None:
+        task_info.progress.observe_chunk(text)
+        if session is not None:
+            await notify_log(text)
+
+    async def tracked_progress(progress: float, total: float | None, message: str | None) -> None:
+        task_info.progress.observe_progress(progress, total, message)
+        try:
+            await notify_progress(progress, total, message)
+        except Exception as e:
+            logger.debug("Failed to forward progress notification: %s", e)
+
     async def _run_logic() -> CommandResponse:
         stata_session = await session_manager.get_or_create_session(session_id)
+        task_info.worker_session = stata_session
         method = "run_do_file" if is_file else "run_command"
         params = {
             "path" if is_file else "code": code,
@@ -1398,14 +1491,14 @@ async def stata_run(
         result_dict = await stata_session.call(
             method,
             params,
-            notify_log=notify_log if session is not None else _noop_log,
-            notify_progress=notify_progress if progress_token is not None else None,
+            notify_log=tracked_log,
+            notify_progress=tracked_progress,
         )
         return CommandResponse.model_validate(result_dict)
 
-    async def _run_task() -> None:
+    async def _run_task(running: "asyncio.Future[CommandResponse] | None" = None) -> None:
         try:
-            result = await _run_logic()
+            result = await (running if running is not None else _run_logic())
             if not task_info.log_path and result.log_path:
                 task_info.log_path = result.log_path
             if result.error:
@@ -1423,9 +1516,22 @@ async def stata_run(
         except Exception as exc:
             task_info.error = str(exc)
         finally:
+            task_info.progress.mark_finished()
             task_info.done = True
-            if background:
+            if background or running is not None:
                 await _notify_task_done(session, task_info, request_id)
+
+    def _finalize_if_never_started(wrapper: "asyncio.Task[None]", running: "asyncio.Future | None" = None) -> None:
+        # A task cancelled before its first step never enters _run_task's
+        # try/finally: nothing marks it done and nothing stops the Stata call.
+        if task_info.done:
+            return
+        if running is not None and not running.done():
+            running.cancel()
+        if wrapper.cancelled() and not task_info.error:
+            task_info.error = "Operation cancelled"
+        task_info.progress.mark_finished()
+        task_info.done = True
 
     if background:
         if session is None:
@@ -1435,6 +1541,7 @@ async def stata_run(
             task_info.task = None
         else:
             task_info.task = asyncio.create_task(_run_task())
+            task_info.task.add_done_callback(_finalize_if_never_started)
         _register_task(task_info)
         await _wait_for_log_path(task_info)
         envelope = _build_envelope(
@@ -1446,14 +1553,52 @@ async def stata_run(
             warnings=warnings,
             next_actions=[
                         f"Before returning to the user, call stata_task_status(task_id='{task_id}', wait=True, timeout=<N>, tail_lines=<M>) to collect the result. Choose timeout based on expected runtime; choose tail_lines based on how much output you want inline. You may do other work first (e.g. launch parallel tasks), but every background task must be waited on before the turn ends.",
-                "If stata_task_status returns status='timeout', call it again. Repeat until status is 'done' or 'failed'.",
+                "If stata_task_status returns status='timeout', the task is still running: tell the user data.progress.summary and call it again. Repeat until status is 'done' or 'failed'.",
                 "After status='done', read data.result for the output. Use stata_read_log with log_path for the full log.",
             ],
         )
         return _envelope_legacy_json(envelope) if as_json else envelope
     else:
-        # Sync execution
-        result = await _run_logic()
+        # Sync execution. A long run is promoted to a background task after
+        # MCP_STATA_AUTO_BACKGROUND_AFTER seconds, so the caller gets a task_id
+        # and live progress instead of an opaque call that never returns.
+        running = asyncio.ensure_future(_run_logic())
+        budget = _auto_background_after()
+        try:
+            await asyncio.wait({running}, timeout=budget if budget > 0 else None)
+        except BaseException:
+            # The request itself was cancelled: take the Stata command down
+            # with it, as a direct await used to.
+            running.cancel()
+            try:
+                await running
+            except BaseException:
+                pass
+            raise
+        if not running.done():
+            task_info.task = asyncio.create_task(_run_task(running))
+            task_info.task.add_done_callback(lambda t: _finalize_if_never_started(t, running))
+            _register_task(task_info)
+            snapshot = await _task_progress_snapshot(task_info, "running")
+            envelope = _build_envelope(
+                tool="stata_run",
+                success=True,
+                session_id=session_id,
+                data=TaskResult(task_id=task_id, status="started").model_dump()
+                | {"log_path": task_info.log_path, "auto_backgrounded": True, "progress": snapshot},
+                log_path=task_info.log_path,
+                warnings=warnings + [
+                    f"Still running after {budget:g}s, so it continues in the background "
+                    f"(set {AUTO_BACKGROUND_ENV}=0 to always wait)."
+                ],
+                next_actions=[
+                    f"Call stata_task_status(task_id='{task_id}', wait=True, timeout=<N>, tail_lines=<M>) to follow it; each call returns data.progress (elapsed time, lines done, current command, stall diagnosis).",
+                    "Tell the user the job is still running, quoting data.progress.summary, before waiting again.",
+                    f"To stop it, call stata_control(action='cancel', id='{task_id}').",
+                ],
+            )
+            return _envelope_legacy_json(envelope) if as_json else envelope
+        result = running.result()
         _ensure_ui_channel()
         if ui_channel:
             ui_channel.notify_potential_dataset_change(session_id)

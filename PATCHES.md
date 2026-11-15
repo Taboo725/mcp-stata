@@ -18,6 +18,11 @@ Keeping the series linear and each commit small is what makes
 | 7 | `test(server): match the compact companion-text default upstream already ships` | `tests/server/test_fastmcp_compact_tool_text.py` |
 | 8 | `fix(server): detect packages by resolving commands, not by reading ado dir` | `src/mcp_stata/server.py` (+1 new test file) |
 | 9 | `fix(deps): cap mcp below 2.0, whose SDK dropped mcp.server.fastmcp` | `pyproject.toml`, `uv.lock` (+1 new test file) |
+| 10 | `fix(smcl): render braces that are not directives as text` | `src/mcp_stata/smcl/smcl2html.py` (+1 new test file) |
+| 11 | `fix(client): interrupt Stata via StataSO_SetBreak when sfi.breakIn is absent` | `src/mcp_stata/stata_client.py` (+3 new test files) |
+| 12 | `fix(client): count do-file progress on tag-free text` | `src/mcp_stata/stata_client.py` |
+| 13 | `fix(sessions): fail pending requests when the worker dies or is stopped` | `src/mcp_stata/sessions.py` (+1 new test file) |
+| 14 | `feat(server): live progress, stall diagnosis and auto-background for long runs` | `src/mcp_stata/server.py` (+1 new module, +2 new test files) |
 
 ## 1. Worker spawn deadlocks on the stdio stdin pipe (Windows)
 
@@ -220,6 +225,102 @@ bound so it is not lost in a rebase.
 entry. If upstream adds its own bound, drop this commit; if it ports to SDK 2,
 drop it and re-lock.
 
+## 10. Literal `{}` in output failed the whole command
+
+**Symptom.** Any command whose echo or output contained `{}` or `{ }` -- a
+Mata loop body, `display "{}"`, a regex -- failed with
+`list index out of range`, and its real output was lost.
+
+**Cause.** `_render_fragment` in `smcl2html.py` took `tag_name.split()[0]`
+without checking for an empty tag; `{:x}` crashed the same way one line up.
+
+**Fix.** Emit tags that are not directives verbatim.
+
+**Conflict risk.** Low, a guard in one function.
+
+## 11. `break` and `cancel` never interrupted Stata
+
+**Symptom.** `stata_control(action="break")` had no effect. `cancel` marked the
+task failed at once, but Stata kept running, and the next command on that
+session queued silently behind it: 60s in testing, indefinitely for a long
+estimation. To an agent this looks exactly like a hung server.
+
+**Cause.** Both paths called `sfi.breakIn`, which current runtimes (StataNow
+19.5) do not have; the code logged at debug level and returned.
+
+**Fix.** `_break_hook()` falls back to `pystata.config.stlib.StataSO_SetBreak()`,
+the call pystata itself makes on Ctrl+C. `sfi.breakIn` is still preferred where
+it exists.
+
+**Measured.** `sleep`, `forvalues` and a busy Mata loop: never interrupted →
+stopped within 0.5s, next command immediate. A break sent while idle does not
+leak into the next command. Upstream's `test_break_session_tool_logic`
+(issue #34) now passes.
+
+**Conflict risk.** Low. `_request_break_in`/`_request_break_in_fast` are
+rewritten around one new static helper.
+
+## 12. Do-file progress stuck at 0/N
+
+**Cause.** The line counter matched `^\.\s+\S` against raw SMCL, where an
+echoed command reads `{com}. regress ...`, so it never matched. It also
+throttled reports to one per 0.25s, which could strand the last count before a
+long silent command.
+
+**Fix.** Match on tag-free text, carry a split line over to the next chunk,
+report on every change.
+
+**Conflict risk.** Low, inside `run_do_file_streaming`'s local callback.
+
+## 13. A dead worker left its request hanging forever
+
+**Symptom.** Kill a worker (crash, OOM, `taskkill`) mid-command and the task
+stays `running` forever; `stata_manage_session(action="stop")` on a busy
+session does the same.
+
+**Cause.** The parent keeps its own copy of the child's pipe end, so a dead
+worker does not reliably produce EOF; when EOF did come, or on `stop()`, the
+pending futures were never resolved.
+
+**Fix.** The listener checks worker liveness while requests are pending and,
+on a closed pipe, a dead worker or a stop, fails them with a message that says
+which. A listener merely replaced on an event-loop change leaves them alone. A
+raising log/progress callback no longer kills the listener.
+
+**Measured.** Killed worker: hung → task `failed` ("exited unexpectedly",
+with exit code) within ~1s; the next call rebuilds the session.
+
+**Conflict risk.** Medium. `_listen_to_worker`'s loop is restructured.
+
+## 14. Long runs were a black box
+
+**Symptom.** A long `stata_run` showed only "calling MCP tool" with no way to
+tell progress from a hang; `stata_task_status` could only say `running`.
+
+**Fix.**
+
+- Every execution keeps a progress record (`task_progress.py`), fed from the
+  log and progress streams the worker already emits.
+- `stata_task_status` returns `data.progress`: elapsed time, lines done/total
+  and percent for do-files, current command, last output, seconds since the last
+  output, worker liveness and a `state`:
+  `running` | `busy_silent` (no output, CPU busy: a long estimation) |
+  `possibly_stuck` (no output, CPU idle: a `--more--`, dialog, lock or network
+  wait) | `worker_dead`, plus a one-line `summary` and matching advice. Worker
+  CPU is sampled only once output has been quiet for `MCP_STATA_STALL_SECONDS`
+  (default 60), via `GetProcessTimes` on Windows and `/proc` on Linux.
+- `wait=True` returns at least every `MCP_STATA_TASK_WAIT_MAX` seconds (default
+  120; `0` disables), so a long job reads as a sequence of progress reports.
+- A synchronous `stata_run` still running after `MCP_STATA_AUTO_BACKGROUND_AFTER`
+  seconds (default 60; `0` disables) returns `auto_backgrounded: true` with a
+  `task_id` and keeps running as a background task. Cancelling the request
+  before then still stops the Stata command.
+- A task cancelled before its first step used to stay `running` forever and
+  leave its Stata call alive; a done-callback now finalizes it.
+
+**Conflict risk.** Medium. `stata_run`'s sync branch and the body of
+`stata_task_status` change; the rest is additive.
+
 ## What is *not* worth doing
 
 Measured and rejected, so it does not get re-proposed:
@@ -253,6 +354,13 @@ Regression tests for the patch series:
   tests/server/test_schema_slim_unit.py \
   tests/server/test_fastmcp_compact_tool_text.py \
   tests/server/test_package_detection_unit.py \
+  tests/server/test_mcp_sdk_bound_unit.py \
+  tests/ui/test_smcl_empty_braces_unit.py \
+  tests/client/test_break_hook_unit.py \
+  tests/server/test_session_worker_death_unit.py \
+  tests/server/test_task_progress_unit.py \
+  tests/execution/cancellation/test_native_break_e2e.py \
+  tests/execution/streaming/test_task_progress_e2e.py \
   tests/execution/startup \
   -q --no-cov
 ```
