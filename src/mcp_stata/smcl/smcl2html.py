@@ -206,12 +206,19 @@ def _render_smcl_layout(text: str) -> str:
             first_colon = inner.find(":")
 
             if first_colon != -1:
-                cmd_candidate = inner[:first_colon].split()[0].lower()
+                head = inner[:first_colon].split()
+                cmd_candidate = head[0].lower() if head else ""
                 if cmd_candidate not in {"col", "column", "space", "hline", ".-"}:
                     tag_name = inner[:first_colon]
                     tag_content = inner[first_colon + 1:]
 
             parts = tag_name.split()
+            if not parts:
+                # Not a directive: braces that are just text, e.g. a Mata loop
+                # body "{}" echoed back, or "{:x}". Keep them verbatim rather
+                # than failing the whole command's output.
+                emit(tag)
+                continue
             command = parts[0].lower()
 
             if command in {"smcl", "/smcl"}:
