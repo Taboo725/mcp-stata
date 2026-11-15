@@ -1521,41 +1521,64 @@ class StataClient:
 
         return cmd or None
 
+    @staticmethod
+    def _break_hook() -> tuple[Optional[Callable[[], Any]], str]:
+        """Return ``(fn, name)`` for the call that interrupts the running command.
+
+        Older runtimes expose ``sfi.breakIn``; current ones (verified on
+        StataNow 19.5) do not, and the only interrupt is the one pystata itself
+        uses on Ctrl+C: ``pystata.config.stlib.StataSO_SetBreak()``. It is safe
+        to call from another thread while ``StataSO_Execute`` is running, which
+        is exactly where the worker's out-of-band listener calls it from.
+        """
+        try:
+            import sfi  # type: ignore[import-not-found]
+
+            fn = getattr(sfi, "breakIn", None) or getattr(sfi, "break_in", None)
+            if callable(fn):
+                return fn, "sfi.breakIn"
+        except Exception:
+            pass
+        try:
+            from pystata import config as pystata_config  # type: ignore[import-not-found]
+
+            lib = getattr(pystata_config, "stlib", None)
+            fn = getattr(lib, "StataSO_SetBreak", None) if lib is not None else None
+            if fn is not None:
+                return fn, "StataSO_SetBreak"
+        except Exception:
+            pass
+        return None, ""
+
     def _request_break_in(self) -> None:
         """
         Attempt to interrupt a running Stata command when cancellation is requested.
 
-        Uses the Stata sfi.breakIn hook when available; errors are swallowed because
-        cancellation should never crash the host process.
+        Errors are swallowed because cancellation should never crash the host process.
         """
+        break_fn, name = self._break_hook()
+        if break_fn is None:  # pragma: no cover - environment without Stata runtime
+            logger.warning("No Stata break hook available; cannot interrupt the running command")
+            return
         try:
-            import sfi  # type: ignore[import-not-found]
-
-            break_fn = getattr(sfi, "breakIn", None) or getattr(sfi, "break_in", None)
-            if callable(break_fn):
-                try:
-                    self._break_requested = True
-                    for _ in range(3):
-                        break_fn()
-                        time.sleep(0.05)
-                    logger.info("Sent breakIn() to Stata for cancellation")
-                    self._poll_break_ack(timeout=3.0)
-                except Exception as e:  # pragma: no cover - best-effort
-                    logger.warning(f"Failed to send breakIn() to Stata: {e}")
-            else:  # pragma: no cover - environment without Stata runtime
-                logger.debug("sfi.breakIn not available; cannot interrupt Stata")
-        except Exception as e:  # pragma: no cover - import failure or other
-            logger.debug(f"Unable to import sfi for cancellation: {e}")
+            self._break_requested = True
+            for _ in range(3):
+                break_fn()
+                time.sleep(0.05)
+            logger.info(f"Sent {name}() to Stata for cancellation")
+            if name == "sfi.breakIn":
+                self._poll_break_ack(timeout=3.0)
+        except Exception as e:  # pragma: no cover - best-effort
+            logger.warning(f"Failed to send {name}() to Stata: {e}")
 
     def _request_break_in_fast(self) -> None:
         """Send a lightweight break signal without polling."""
+        break_fn, _ = self._break_hook()
+        if break_fn is None:
+            return
         try:
-            import sfi  # type: ignore[import-not-found]
-
-            break_fn = getattr(sfi, "breakIn", None) or getattr(sfi, "break_in", None)
-            if callable(break_fn):
-                self._break_requested = True
-                break_fn()
+            self._break_requested = True
+            break_fn()
         except Exception:
             return
 
