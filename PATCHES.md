@@ -17,6 +17,7 @@ Keeping the series linear and each commit small is what makes
 | 6 | `perf(server): drop pydantic title noise from advertised tool schemas` | `src/mcp_stata/server.py` (+1 new module, +1 new test file) |
 | 7 | `test(server): match the compact companion-text default upstream already ships` | `tests/server/test_fastmcp_compact_tool_text.py` |
 | 8 | `fix(server): detect packages by resolving commands, not by reading ado dir` | `src/mcp_stata/server.py` (+1 new test file) |
+| 9 | `fix(deps): cap mcp below 2.0, whose SDK dropped mcp.server.fastmcp` | `pyproject.toml`, `uv.lock` (+1 new test file) |
 
 ## 1. Worker spawn deadlocks on the stdio stdin pipe (Windows)
 
@@ -202,6 +203,23 @@ genuine (`which gcollapse` also fails, so `gtools` really is absent).
 **Conflict risk.** Low. `_package_summary` is replaced wholesale and gains two
 helpers next to it; the `detect` branch gains one extra session call.
 
+## 9. MCP SDK 2.0 breaks start-up
+
+**Symptom.** A fresh `pip install mcp-stata` (or `uv lock --upgrade`) pulls
+`mcp` 2.x and the server dies on launch with
+`ModuleNotFoundError: No module named 'mcp.server.fastmcp'` (upstream issue #64).
+
+**Cause.** `pyproject.toml` required `mcp[cli]>=1.0.0` with no upper bound, and
+SDK 2.0 removed the `mcp.server.fastmcp` package the server is built on.
+
+**Fix.** Require `mcp[cli]>=1.0.0,<2`. The lock stays on 1.24.0; an upgrade now
+resolves within 1.x (1.30.0 at the time of writing). A unit test asserts the
+bound so it is not lost in a rebase.
+
+**Conflict risk.** Low, one line in `pyproject.toml` plus the matching lock
+entry. If upstream adds its own bound, drop this commit; if it ports to SDK 2,
+drop it and re-lock.
+
 ## What is *not* worth doing
 
 Measured and rejected, so it does not get re-proposed:
@@ -224,7 +242,7 @@ Either one fetches `upstream`, fast-forwards `main`, rebases `mine` onto it and
 reminds you to re-run the tests. On a conflict, fix the hunk, `git add`, then
 `git rebase --continue`; this file tells you what each commit was for.
 
-Regression tests for all four patches:
+Regression tests for the patch series:
 
 ```sh
 .venv/Scripts/python.exe -m pytest \
