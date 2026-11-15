@@ -525,6 +525,9 @@ class BackgroundTask:
     progress: task_progress.TaskProgress = field(default_factory=task_progress.TaskProgress)
     # The session object the task actually ran on, for liveness/CPU probes.
     worker_session: Any = None
+    # Set once a status call has shown this task finished, so the all-tasks
+    # view reports each completion once.
+    reported: bool = False
 
 
 _background_tasks: Dict[str, BackgroundTask] = {}
@@ -808,6 +811,96 @@ def _task_wait_cap() -> float:
 
 def _auto_background_after() -> float:
     return _env_seconds(AUTO_BACKGROUND_ENV, _DEFAULT_AUTO_BACKGROUND_AFTER)
+
+
+AUTO_SESSION_ID = "auto"
+AUTO_SESSION_PREFIX = "auto-"
+MAX_AUTO_SESSIONS_ENV = "MCP_STATA_MAX_AUTO_SESSIONS"
+_DEFAULT_MAX_AUTO_SESSIONS = 3
+# session id -> number of stata_run calls currently holding it.
+_auto_claims: Dict[str, int] = {}
+# Learned ceiling: set when a new auto session fails to start (e.g. no free
+# network-licence seat), so later calls stop trying to create more.
+_auto_capacity: Optional[int] = None
+
+
+def _max_auto_sessions() -> int:
+    raw = (os.environ.get(MAX_AUTO_SESSIONS_ENV) or "").strip()
+    if not raw:
+        return _DEFAULT_MAX_AUTO_SESSIONS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_AUTO_SESSIONS
+
+
+def _auto_index(name: str) -> int:
+    try:
+        return int(name[len(AUTO_SESSION_PREFIX):])
+    except ValueError:
+        return 1 << 30
+
+
+def _auto_load(session_id: str) -> int:
+    load = _auto_claims.get(session_id, 0)
+    worker = session_manager._sessions.get(session_id)
+    probe = getattr(worker, "busy_with", None)
+    if callable(probe):
+        try:
+            if probe():
+                load += 1
+        except Exception:
+            pass
+    return load
+
+
+def _claim_auto_session() -> str:
+    """Pick the session for a ``session_id="auto"`` run and reserve it.
+
+    Synchronous on purpose: no await between choosing and reserving, so
+    concurrent auto runs never pick the same idle session. Prefers an idle
+    ``auto-N`` session, then creates one up to the cap, then queues on the
+    least loaded. Never uses ``default``: that is the interactive session.
+    """
+    names = sorted(
+        {sid for sid in session_manager._sessions if sid.startswith(AUTO_SESSION_PREFIX)} | set(_auto_claims),
+        key=_auto_index,
+    )
+    idle = [name for name in names if _auto_load(name) == 0]
+    cap = _max_auto_sessions() if _auto_capacity is None else min(_max_auto_sessions(), _auto_capacity)
+    if idle:
+        choice = idle[0]
+    elif len(names) < cap or not names:
+        used = {_auto_index(name) for name in names}
+        index = 1
+        while index in used:
+            index += 1
+        choice = f"{AUTO_SESSION_PREFIX}{index}"
+    else:
+        choice = min(names, key=lambda name: (_auto_load(name), _auto_index(name)))
+    _auto_claims[choice] = _auto_claims.get(choice, 0) + 1
+    return choice
+
+
+def _release_auto_session(session_id: str) -> None:
+    remaining = _auto_claims.get(session_id, 0) - 1
+    if remaining > 0:
+        _auto_claims[session_id] = remaining
+    else:
+        _auto_claims.pop(session_id, None)
+
+
+def _auto_fallback(failed: str) -> Optional[str]:
+    """After *failed* could not start, the least loaded running auto session."""
+    global _auto_capacity
+    existing = [
+        sid for sid in session_manager._sessions
+        if sid.startswith(AUTO_SESSION_PREFIX) and sid != failed
+    ]
+    if not existing:
+        return None
+    _auto_capacity = len(existing)
+    return min(existing, key=lambda name: (_auto_load(name), _auto_index(name)))
 
 
 def _busy_session_warning(session_id: str, behind: str) -> str:
@@ -1159,7 +1252,9 @@ async def stata_task_status(
         # if status == "timeout", call again until "done" or "failed"
 
     Args:
-        task_id: The unique identifier of the background task to query.
+        task_id: The unique identifier of the background task to query, or "all" for one
+            row per active task plus tasks finished since the last check (each reported
+            once); with wait=True, "all" returns as soon as any task finishes.
         wait: If True, the call will block until the task finishes or the timeout is reached.
         timeout: Maximum seconds to wait, capped at MCP_STATA_TASK_WAIT_MAX (default 120) so
             long jobs report back regularly. On status='timeout' the task is still running:
@@ -1177,6 +1272,8 @@ async def stata_task_status(
         idle CPU) or worker_dead.
     """
     _log_tool_call("stata_task_status")
+    if task_id in {"all", "*"}:
+        return await _all_tasks_status(wait=wait, timeout=timeout, poll_interval=poll_interval, as_json=as_json)
     start_time = time.time()
     cap = _task_wait_cap()
     if wait and cap > 0 and timeout > cap:
@@ -1201,8 +1298,11 @@ async def stata_task_status(
             elif _task_queue_state(task_info) is not None:
                 status = "queued"
             
+            if task_info.done:
+                task_info.reported = True
             res = {
                 "task_id": task_id,
+                "session_id": task_info.session_id,
                 "status": status,
                 "kind": task_info.kind,
                 "created_at": task_info.created_at.isoformat(),
@@ -1245,6 +1345,66 @@ async def stata_task_status(
             return _envelope_legacy_json(envelope) if as_json else envelope
 
         await asyncio.sleep(poll_interval)
+
+
+async def _all_tasks_status(*, wait: bool, timeout: float, poll_interval: float, as_json: bool) -> ToolEnvelope | str:
+    cap = _task_wait_cap()
+    if wait and cap > 0 and timeout > cap:
+        timeout = cap
+    start = time.time()
+
+    def _fresh_finished() -> bool:
+        return any(t.done and not t.reported for t in _background_tasks.values())
+
+    while wait and not _fresh_finished():
+        if not any(not t.done for t in _background_tasks.values()):
+            break
+        if time.time() - start >= timeout:
+            break
+        await asyncio.sleep(poll_interval)
+
+    rows: list[dict[str, Any]] = []
+    counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+    for info in sorted(_background_tasks.values(), key=lambda t: t.created_at.timestamp()):
+        if info.done and info.reported:
+            continue
+        if info.done:
+            status = "failed" if info.error else "done"
+        elif _task_queue_state(info) is not None:
+            status = "queued"
+        else:
+            status = "running"
+        snapshot = await _task_progress_snapshot(info, status)
+        row: dict[str, Any] = {
+            "task_id": info.task_id,
+            "session_id": info.session_id,
+            "kind": info.kind,
+            "status": status,
+            "state": snapshot.get("state"),
+            "summary": snapshot.get("summary"),
+        }
+        if info.error:
+            row["error"] = info.error[:300]
+        if info.done:
+            info.reported = True
+        counts[status] += 1
+        rows.append(row)
+
+    next_actions: list[str] = []
+    if counts["queued"] or counts["running"]:
+        next_actions.append(
+            "Call stata_task_status(task_id='all', wait=True) to wait for the next task to finish; "
+            "tell the user each task's summary in between."
+        )
+    if counts["done"] or counts["failed"]:
+        next_actions.append("Fetch a finished task's output with stata_task_status(task_id=<id>).")
+    envelope = _build_envelope(
+        tool="stata_task_status",
+        success=True,
+        data={"tasks": rows, "counts": counts},
+        next_actions=next_actions,
+    )
+    return _envelope_legacy_json(envelope) if as_json else envelope
 
 
 @mcp.tool(structured_output=True)
@@ -1373,7 +1533,11 @@ async def stata_run(
         raw: If True, returns only the raw text output or error message.
         max_output_lines: Optional limit for the number of lines returned in synchronous mode.
         cwd: Optional working directory for the Stata process during execution.
-        session_id: The ID of the Stata session to use (defaults to "default").
+        session_id: The ID of the Stata session to use (defaults to "default"). Stata runs
+            one command at a time per session; pass "auto" to run on an idle worker session
+            (auto-1, auto-2, ... up to MCP_STATA_MAX_AUTO_SESSIONS, default 3) so independent
+            jobs run in parallel. Auto sessions start empty: load data inside the job. The
+            result's session_id says which one was used.
         strip_smcl: If True, removes Stata SMCL tags from the output for readability.
         filter_pattern: Optional regex to include only matching lines in the output.
         exclude_pattern: Optional regex to omit matching lines from the output.
@@ -1428,6 +1592,16 @@ async def stata_run(
             if not allowed:
                 path_warnings.append(reason or "Path is outside the default allowlist.")
         warnings.extend(path_warnings)
+
+    claim: dict[str, str] = {}
+    if session_id == AUTO_SESSION_ID:
+        session_id = _claim_auto_session()
+        claim["sid"] = session_id
+
+    def _release_claim() -> None:
+        held = claim.pop("sid", None)
+        if held:
+            _release_auto_session(held)
 
     session = getattr(getattr(ctx, "request_context", None), "session", None) if ctx is not None else None
     request_id = ctx.request_id if ctx is not None else None
@@ -1511,8 +1685,33 @@ async def stata_run(
         except Exception as e:
             logger.debug("Failed to forward progress notification: %s", e)
 
+    async def _open_session():
+        nonlocal session_id
+        try:
+            return await session_manager.get_or_create_session(session_id)
+        except Exception as exc:
+            fallback = _auto_fallback(session_id) if claim else None
+            if fallback is None:
+                raise
+            warnings.append(
+                f"Stata session {session_id} could not start ({exc}); ran on {fallback} instead. "
+                f"No further sessions will be created automatically."
+            )
+            _release_claim()
+            _auto_claims[fallback] = _auto_claims.get(fallback, 0) + 1
+            claim["sid"] = fallback
+            session_id = fallback
+            task_info.session_id = fallback
+            return await session_manager.get_or_create_session(session_id)
+
     async def _run_logic() -> CommandResponse:
-        stata_session = await session_manager.get_or_create_session(session_id)
+        try:
+            return await _run_logic_inner()
+        finally:
+            _release_claim()
+
+    async def _run_logic_inner() -> CommandResponse:
+        stata_session = await _open_session()
         task_info.worker_session = stata_session
         method = "run_do_file" if is_file else "run_command"
         params = {
@@ -1568,6 +1767,7 @@ async def stata_run(
     def _finalize_if_never_started(wrapper: "asyncio.Task[None]", running: "asyncio.Future | None" = None) -> None:
         # A task cancelled before its first step never enters _run_task's
         # try/finally: nothing marks it done and nothing stops the Stata call.
+        _release_claim()
         if task_info.done:
             return
         if running is not None and not running.done():
@@ -1613,6 +1813,8 @@ async def stata_run(
         # MCP_STATA_AUTO_BACKGROUND_AFTER seconds, so the caller gets a task_id
         # and live progress instead of an opaque call that never returns.
         running = asyncio.ensure_future(_run_logic())
+        # Cancelled before its first step, _run_logic's finally never runs.
+        running.add_done_callback(lambda _t: _release_claim())
         budget = _auto_background_after()
         try:
             await asyncio.wait({running}, timeout=budget if budget > 0 else None)
