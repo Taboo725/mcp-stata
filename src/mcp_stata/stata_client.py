@@ -3714,22 +3714,32 @@ class StataClient:
         except Exception:
             dofile_text = ""
         executed_lines = 0
-        last_progress_time = 0.0
+        reported_lines = 0
+        partial_line = ""
         dot_prompt = _DOT_PROMPT_RE
 
         async def on_chunk_for_progress(chunk: str) -> None:
-            nonlocal executed_lines, last_progress_time
+            nonlocal executed_lines, reported_lines, partial_line
             if total_lines <= 0 or notify_progress is None:
                 return
-            for line in chunk.splitlines():
-                if dot_prompt.match(line):
+            # The chunk is raw SMCL, where an echoed command reads
+            # "{com}. regress ..."; match on the tag-free text, and carry an
+            # unterminated last line over so a prompt split across two reads
+            # is neither missed nor counted twice.
+            text = partial_line + chunk
+            lines = text.split("\n")
+            partial_line = lines.pop()
+            for line in lines:
+                if dot_prompt.match(_SMCL_TAG_RE.sub("", line)):
                     executed_lines += 1
                     if executed_lines > total_lines:
                         executed_lines = total_lines
 
-            now = time.monotonic()
-            if executed_lines > 0 and (now - last_progress_time) >= 0.25:
-                last_progress_time = now
+            # Chunks arrive at most every ~50ms, so reporting on every change
+            # is cheap -- and a throttle could strand the last count before a
+            # long silent command.
+            if executed_lines > reported_lines:
+                reported_lines = executed_lines
                 await notify_progress(
                     float(executed_lines),
                     float(total_lines),
