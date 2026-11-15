@@ -23,6 +23,8 @@ Keeping the series linear and each commit small is what makes
 | 12 | `fix(client): count do-file progress on tag-free text` | `src/mcp_stata/stata_client.py` |
 | 13 | `fix(sessions): fail pending requests when the worker dies or is stopped` | `src/mcp_stata/sessions.py` (+1 new test file) |
 | 14 | `feat(server): live progress, stall diagnosis and auto-background for long runs` | `src/mcp_stata/server.py` (+1 new module, +2 new test files) |
+| 15 | `feat(sessions): show queued work and cancel it without breaking the job ahead` | `src/mcp_stata/sessions.py`, `worker.py`, `server.py`, `task_progress.py`, `models.py` (+2 new test files) |
+| 16 | `feat(server): session_id="auto" for parallel jobs, and an all-tasks view` | `src/mcp_stata/server.py` (+3 new test files) |
 
 ## 1. Worker spawn deadlocks on the stdio stdin pipe (Windows)
 
@@ -321,6 +323,55 @@ tell progress from a hang; `stata_task_status` could only say `running`.
 **Conflict risk.** Medium. `stata_run`'s sync branch and the body of
 `stata_task_status` change; the rest is additive.
 
+## 15. Queued work looked like running (or stuck) work
+
+**Symptom.** A second job sent to a busy session reported `running`, and after
+a minute of waiting the stall diagnosis would call it stuck. Worse,
+`stata_run(background=True)` on a busy session did not return at all until the
+previous job finished, because it waited for a log path that only appears once
+a command starts executing. And once patch 11 made break real, cancelling a
+*queued* job sent a break that killed the job ahead of it.
+
+**Fix.**
+
+- `StataSession` records in-flight requests in send order -- the worker's FIFO
+  order -- and exposes `queue_state(label)` / `busy_with()`; `stata_run` tags its
+  call with the task id.
+- Cancelling sends `break` only for the executing request. A queued one is
+  withdrawn with a new out-of-band `{"type": "cancel", "target": id}` message;
+  the worker skips it unstarted and answers "Cancelled while queued".
+- A waiting task reports `status: "queued"`, `queued_behind`, progress state
+  `queued` (never quiet/stuck). Background submissions to a busy session return
+  at once as queued; a promoted sync call says the same. Both warn that a
+  separate `session_id` runs in parallel. Queue time is reported as `queued_s`
+  and no longer counts toward quiet time.
+
+**Measured.** Submitting behind an 8s job: blocked ~8s → returns in <0.1s.
+Cancelling the queued job leaves the running one to finish normally.
+
+**Conflict risk.** Medium. `_call_raw`'s cancellation branch and the worker's
+main loop change; the rest is additive.
+
+## 16. Parallel work needed manual session juggling
+
+**Fix.**
+
+- `stata_run(session_id="auto")` picks an idle `auto-N` session, else starts a
+  new one up to `MCP_STATA_MAX_AUTO_SESSIONS` (default 3), else queues on the
+  least loaded. The choice is made and reserved synchronously, so concurrent
+  auto runs never collide. It never uses `default`, so interactive state is
+  safe; the result's `session_id` names the session used. If a new session fails
+  to start (e.g. no free network-licence seat) the run falls back to an existing
+  auto session and no more are created.
+- `stata_task_status(task_id="all")` returns one row per active task plus each
+  task finished since the last check, reported once; with `wait=True` it returns
+  as soon as any task finishes. Single-task status rows now carry `session_id`.
+
+**Measured.** Three 6s jobs: 19.3s on one session → 6.7s with `auto`.
+
+**Conflict risk.** Low. New helpers plus a few lines at the top of `stata_run`
+and `stata_task_status`.
+
 ## What is *not* worth doing
 
 Measured and rejected, so it does not get re-proposed:
@@ -361,6 +412,11 @@ Regression tests for the patch series:
   tests/server/test_task_progress_unit.py \
   tests/execution/cancellation/test_native_break_e2e.py \
   tests/execution/streaming/test_task_progress_e2e.py \
+  tests/server/test_session_queue_unit.py \
+  tests/server/test_auto_sessions_unit.py \
+  tests/execution/cancellation/test_session_queue_e2e.py \
+  tests/execution/cancellation/test_auto_sessions_e2e.py \
+  tests/execution/cancellation/test_mixed_workload_e2e.py \
   tests/execution/startup \
   -q --no-cov
 ```
